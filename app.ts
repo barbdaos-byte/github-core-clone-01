@@ -1,49 +1,54 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
+// The forge server: one in-memory store, four surfaces.
 //
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+//   GET  /healthz                    the env's boot probe (no auth)
+//   /api/v3/*                        REST v3 (src/rest.ts)
+//   /api/graphql                     GraphQL v4 (src/graphql.ts)
+//   /mcp                             MCP, JSON-RPC 2.0 (src/mcp.ts)
+//   /{owner}/{repo}.git/*            git smart HTTP (src/git.ts)
+//
+// Anything else is a JSON 404, never HTML. A handler that throws answers a
+// JSON 500 and never leaks a stack.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { handleGit } from './src/git.ts';
+import { handleGraphql } from './src/graphql.ts';
+import { buildContext, sendError, sendJson } from './src/http.ts';
+import { handleMcp } from './src/mcp.ts';
+import { handleRest } from './src/rest.ts';
+import { ForgeStore } from './src/store.ts';
+import { viewerLogin } from './src/viewer.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+export { viewerLogin };
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
-}
-
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
-
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
+/** Build the server. It binds nothing until the caller listens. */
 export function createApp(): Server {
+  const store = new ForgeStore();
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+    void handleRequest(req, res, store).catch(() => {
+      if (!res.headersSent && !res.writableEnded) {
+        res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+        res.end('{"message":"Internal Server Error"}\n');
+      }
+    });
   });
+}
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse, store: ForgeStore): Promise<void> {
+  const ctx = await buildContext(req, res);
+  try {
+    // The env's boot check calls this twice: 200 {"ok":true}, no token.
+    if (ctx.method === 'GET' && ctx.path === '/healthz') {
+      sendJson(ctx, 200, { ok: true });
+      return;
+    }
+    if (handleRest(ctx, store)) return;
+    if (handleGraphql(ctx, store)) return;
+    if (handleMcp(ctx, store)) return;
+    if (handleGit(ctx, store)) return;
+    sendError(ctx, 404, 'Not Found');
+  } catch (err) {
+    if (!res.headersSent && !res.writableEnded) {
+      sendError(ctx, 500, err instanceof Error ? err.message : 'Internal Server Error');
+    }
+  }
 }

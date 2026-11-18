@@ -16,7 +16,7 @@
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
-import { createApp } from './app.ts';
+import { createApp, viewerLogin } from './app.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -85,7 +85,9 @@ async function main(): Promise<void> {
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  // The forge serves one viewer: the login the trial token names. Logging it
+  // here is the only place the lifecycle prints the forge's identity.
+  process.stdout.write(`[entry] listening on port ${address.port} as ${viewerLogin()}\n`);
 
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
